@@ -1,0 +1,5 @@
+{
+    "shortname": "certificate_gen",
+	"is_active": true,
+	"type": "api"
+}
