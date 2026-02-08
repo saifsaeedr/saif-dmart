@@ -333,7 +333,7 @@ async def login(response: Response, request: UserLoginRequest, http_request: Req
                         message="User does not exist"
                     )
                 )
-            if user.type == UserType.mobile and user.locked_to_device and (not request.firebase_token or not user.firebase_token or request.firebase_token != user.firebase_token):
+            if user.type == UserType.mobile and user.locked_to_device and user.firebase_token and (not request.firebase_token or request.firebase_token != user.firebase_token):
                 raise api.Exception(
                     status.HTTP_401_UNAUTHORIZED,
                     api.Error(type="auth", code=InternalErrorCode.USER_ACCOUNT_LOCKED,  message="This account is locked to a unique device !"),
@@ -476,7 +476,7 @@ async def login(response: Response, request: UserLoginRequest, http_request: Req
                 or is_password_valid
             )
         ):
-            if request.invitation is None and user.type == UserType.mobile and (not request.firebase_token or not user.firebase_token or request.firebase_token != user.firebase_token):
+            if request.invitation is None and user.type == UserType.mobile and user.firebase_token and (not request.firebase_token or request.firebase_token != user.firebase_token):
                 if user.locked_to_device:
                     raise api.Exception(
                         status.HTTP_401_UNAUTHORIZED,
@@ -673,7 +673,7 @@ async def update_profile(
 
     old_version_flattened = flatten_dict(user.model_dump())
 
-    if profile_user.password:
+    if profile_user.password and user.password and not user.force_password_change:
         if "old_password" not in profile.attributes:
             raise Exception(
                 status.HTTP_403_FORBIDDEN,
@@ -1015,10 +1015,9 @@ async def reset_password(user_request: PasswordResetRequest) -> api.Response:
                     if token:
                         shortened_link = await repository.url_shortner(token)
                         await send_email(
-                            from_address=settings.email_sender,
-                            to_address=user.email,
-                            message=reset_password_message.replace("{link}", shortened_link),
-                            subject="Reset password",
+                            user.email,
+                            reset_password_message.replace("{link}", shortened_link),
+                            "Reset password",
                         )
                     else:
                         logger.warning("token could not be generated")
@@ -1160,9 +1159,8 @@ async def user_reset(
         if token:
             email_link = await repository.url_shortner(token)
             await send_email(
-                from_address=settings.email_sender,
-                to_address=user.email,
-                message=generate_email_from_template(
+                user.email,
+                generate_email_from_template(
                     "activation",
                     {
                         "link": email_link,
@@ -1171,7 +1169,7 @@ async def user_reset(
                         "msisdn": user.msisdn,
                     },
                 ),
-                subject=generate_subject("activation"),
+                generate_subject("activation"),
             )
 
     return api.Response(

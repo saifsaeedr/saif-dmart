@@ -1019,15 +1019,23 @@ class SQLAdapter(BaseDataAdapter):
 
     def __init__(self):
         if SQLAdapter._engine is None:
-            SQLAdapter._engine = create_async_engine(
-                URL.create(
+            if "sqlite" in settings.database_driver:
+                url = URL.create(
+                    drivername=settings.database_driver,
+                    database=settings.database_name,
+                )
+            else:
+                url = URL.create(
                     drivername=settings.database_driver,
                     host=settings.database_host,
                     port=settings.database_port,
                     username=settings.database_username,
                     password=settings.database_password,
                     database=settings.database_name,
-                ),
+                )
+
+            SQLAdapter._engine = create_async_engine(
+                url,
                 echo=False,
                 pool_pre_ping=True,
                 pool_size=settings.database_pool_size,
@@ -2758,19 +2766,46 @@ class SQLAdapter(BaseDataAdapter):
             folder_meta.payload.body.get("unique_fields", None), list):  # type: ignore
             return True
 
+        current_record = None
+        if action is api.RequestType.update:
+            try:
+                resource_class = getattr(
+                    sys_modules["models.core"], camel_case(record.resource_type)
+                )
+                current_record = await self.load(space_name, record.subpath, record.shortname, resource_class)
+            except Exception:
+                current_record = None
+
         current_user = None
         if action is api.RequestType.update and record.resource_type is ResourceType.user:
-            current_user = await self.load(space_name, record.subpath, record.shortname, core.User)
+            current_user = current_record
 
         for compound in folder_meta.payload.body["unique_fields"]:  # type: ignore
             query_string = ""
             for composite_unique_key in compound:
-                value = get_nested_value(record.attributes, composite_unique_key)
+                is_payload_body_field = composite_unique_key.startswith("payload.body.")
+                payload_path = ""
+                
+                if is_payload_body_field:
+                    payload_path = composite_unique_key.replace("payload.body.", "", 1)
+                    payload_body = record.attributes.get("payload", {}).get("body", {})
+                    value = get_nested_value(payload_body, payload_path) if isinstance(payload_body, dict) else None
+                else:
+                    value = get_nested_value(record.attributes, composite_unique_key)
+                
                 if value is None or value == "":
                     continue
-                if current_user is not None and hasattr(current_user, composite_unique_key) \
-                        and getattr(current_user, composite_unique_key) == value:
-                    continue
+                    
+                if current_user is not None:
+                    if is_payload_body_field:
+                        user_payload = getattr(current_user, "payload", None)
+                        if user_payload and isinstance(user_payload.body, dict):
+                            user_value = get_nested_value(user_payload.body, payload_path) if isinstance(user_payload.body, dict) else None
+                            if user_value == value:
+                                continue
+                    else:
+                        if hasattr(current_user, composite_unique_key) and getattr(current_user, composite_unique_key) == value:
+                            continue
 
                 query_string += f"@{composite_unique_key}:{value} "
 
@@ -2784,7 +2819,14 @@ class SQLAdapter(BaseDataAdapter):
                 search=query_string
             )
             owner = record.attributes.get("owner_shortname", None) if user_shortname is None else user_shortname
-            total, _ = await self.query(q, owner)
+            total, records = await self.query(q, owner)
+
+            if action is api.RequestType.update and current_record is not None:
+                records = [r for r in records if not (r.shortname == record.shortname and r.subpath == record.subpath)]
+                if total == 1:
+                    total = 0
+                else:
+                    total = len(records)
 
             if total != 0:
                 raise API_Exception(
