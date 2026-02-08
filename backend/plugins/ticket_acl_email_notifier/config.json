@@ -1,22 +1,21 @@
 {
-  "shortname": "ticket_acl_email_notifier",
-  "is_active": true,
-  "filters": {
-    "subpaths": ["__ALL__"],
-    "resource_types": ["content"],
-    "schema_shortnames": ["__ALL__"],
-    "actions": ["update"]
-  },
-  "type": "hook",
-  "ordinal": 1,
-  "listen_time": "after",
-  "smtp_config": {
-    "host": "email-smtp.eu-central-1.amazonaws.com",
-    "port": 587,
-    "username": "AKIARXE6PAH7JZTYWPXL",
-    "password": "BPn9sC24rZG4FvnHLK6n53g5uJxpFyScuQRQSIkGDhAW",
-    "from_address": "noreply@zainmart.com",
-    "from_name": "no-reply"
-  }
+    "filters": {
+        "actions": [
+            "update"
+        ],
+        "resource_types": [
+            "ticket"
+        ],
+        "schema_shortnames": [
+            "__ALL__"
+        ],
+        "subpaths": [
+            "__ALL__"
+        ]
+    },
+    "is_active": true,
+    "listen_time": "after",
+    "ordinal": 1,
+    "shortname": "ticket_acl_email_notifier",
+    "type": "hook"
 }
-
