@@ -2651,7 +2651,19 @@ class SQLAdapter(BaseDataAdapter):
 
         for idx, item in enumerate(results):
             rec = item.to_record(item.subpath, item.shortname)
+            if rec.resource_type is ResourceType.user and 'password' in rec.attributes:
+                del rec.attributes['password']
             results[idx] = rec
+
+            if query.type == QueryType.history:
+                del rec.attributes['request_headers']
+                for main_key, changes in rec.attributes['diff'].items():
+                    if not isinstance(changes, dict):
+                        continue
+                    for state in ("old", "new"):
+                        value = changes.get(state)
+                        if isinstance(value, dict):
+                            value.pop("headers", None)
 
             if process_payload:
                 # Strip payload body early (if disabled)
