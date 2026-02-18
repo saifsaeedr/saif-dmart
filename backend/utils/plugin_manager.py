@@ -77,6 +77,7 @@ class PluginManager:
             sys.modules[module_name] = module
             if not spec.loader:
                 continue
+            setattr(module, "app", app)  # so plugins can e.g. add_middleware(app)
             spec.loader.exec_module(module)
             try:
                 # Register the API plugin routes
