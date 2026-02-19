@@ -44,33 +44,33 @@ def _shortname_from_body(body: dict) -> str | None:
     return None
 
 
-async def _resolve_shortname_by_oodi_in_body(identifier_value: str, config: dict, by_shortname: bool = False) -> str | None:
+QUERY_USER = "dmart"
+OODI_NUMBER_FIELD = "oodi_number"
+
+
+async def _resolve_shortname_by_oodi_in_body(identifier_value: str, by_shortname: bool = False) -> str | None:
     """
-    Find a user by oodi number in payload.body.
-    If by_shortname=True, identifier_value is a shortname: load user and check payload.body has oodi_number/msisdn (we just return that shortname if we can load user and config says we care).
-    If by_shortname=False, identifier_value is msisdn: search users where payload.body.oodi_number (or msisdn) = value.
+    Find a user by oodi number in payload.body (field oodi_number, query_user dmart).
+    If by_shortname=True: load user by shortname and return it if payload.body has oodi_number.
+    If by_shortname=False: search users where payload.body.oodi_number = identifier_value.
     """
     from data_adapters.adapter import data_adapter as db
     from utils.settings import settings
     import models.api as api
     import models.core as core
 
-    payload_field = (config or {}).get("payload_body_msisdn_field") or "oodi_number"
-    query_user = (config or {}).get("query_user") or "dmart"
-
     if by_shortname:
         user = await db.load_or_none(settings.management_space, "/users", identifier_value, core.User)
         if not user:
             return None
         payload_body = getattr(getattr(user, "payload", None), "body", None)
-        if isinstance(payload_body, dict) and (payload_body.get(payload_field) or payload_body.get("msisdn")):
+        if isinstance(payload_body, dict) and payload_body.get(OODI_NUMBER_FIELD):
             return identifier_value
         return None
 
     try:
         search_value = identifier_value.replace("\\", "\\\\").replace('"', '\\"')
-        # Resolve by payload.body.oodi_number (not user's msisdn meta attribute — that's get_user_by_criteria)
-        search = f'@payload.body.{payload_field}:{search_value}'
+        search = f"@payload.body.{OODI_NUMBER_FIELD}:{search_value}"
         query = api.Query(
             type=api.QueryType.search,
             space_name=settings.management_space,
@@ -80,24 +80,11 @@ async def _resolve_shortname_by_oodi_in_body(identifier_value: str, config: dict
             offset=0,
             retrieve_json_payload=False,
         )
-        print(f"[oodi_login] resolve by payload.body: search={search!r} query_user={query_user!r}")
-        total, records = await db.query(query, query_user)
-        print(f"[oodi_login] query result: total={total} records={len(records) if records else 0} first_shortname={records[0].shortname if records else None!r}")
+        total, records = await db.query(query, QUERY_USER)
         if total and records:
             return records[0].shortname
-        # Fallback: try payload.body.msisdn (still body, not meta msisdn)
-        if payload_field != "msisdn":
-            search2 = f'@payload.body.msisdn:{search_value}'
-            query.search = search2
-            print(f"[oodi_login] fallback search payload.body.msisdn: {search2!r}")
-            total, records = await db.query(query, query_user)
-            print(f"[oodi_login] fallback result: total={total} first_shortname={records[0].shortname if records else None!r}")
-            if total and records:
-                return records[0].shortname
-        print(f"[oodi_login] no user found for identifier_value={identifier_value!r} (payload.body lookup)")
         return None
-    except Exception as exc:
-        print(f"[oodi_login] _resolve_shortname_by_oodi_in_body error: {exc!r}")
+    except Exception:
         return None
 
 
@@ -118,8 +105,7 @@ class _OodiLoginMiddleware:
             await self.app(scope, receive, send)
             return
 
-        config = _get_config()
-        if not config:
+        if not _get_config():
             await self.app(scope, receive, send)
             return
 
@@ -150,16 +136,12 @@ class _OodiLoginMiddleware:
 
         msisdn_value = _msisdn_from_body(data)
         shortname_value = _shortname_from_body(data)
-        print(f"[oodi_login] login body: msisdn={msisdn_value!r} shortname={shortname_value!r} has_otp={has_otp} has_password={has_password}")
 
-        # Try oodi-in-body: identifier is msisdn or shortname (payload.body.oodi_number / msisdn, not meta msisdn)
         shortname = None
         if msisdn_value is not None:
-            shortname = await _resolve_shortname_by_oodi_in_body(msisdn_value, config, by_shortname=False)
-            print(f"[oodi_login] middleware: msisdn={msisdn_value!r} -> shortname={shortname!r}")
+            shortname = await _resolve_shortname_by_oodi_in_body(msisdn_value, by_shortname=False)
         elif shortname_value is not None:
-            shortname = await _resolve_shortname_by_oodi_in_body(shortname_value, config, by_shortname=True)
-            print(f"[oodi_login] middleware: shortname={shortname_value!r} (by_shortname) -> shortname={shortname!r}")
+            shortname = await _resolve_shortname_by_oodi_in_body(shortname_value, by_shortname=True)
 
         if shortname and msisdn_value is not None and not has_otp:
             # Password login with msisdn (oodi): rewrite to shortname so only one identifier
@@ -185,24 +167,16 @@ def _apply_patches() -> None:
     async def _get_shortname_wrapper(*args, **kwargs):
         key = kwargs.get("key", args[0] if args else None)
         value = kwargs.get("value", args[1] if len(args) > 1 else None)
-        print(f"[oodi_login] get_shortname_from_identifier called: key={key!r} value={value!r}")
         try:
-            out = await _original_get_shortname(*args, **kwargs)
-            print(f"[oodi_login] get_shortname_from_identifier original returned: {out!r}")
-            return out
+            return await _original_get_shortname(*args, **kwargs)
         except api.Exception as e:
-            print(f"[oodi_login] get_shortname_from_identifier original raised: status_code={getattr(e, 'status_code', None)} error.code={getattr(getattr(e, 'error', None), 'code', None)}")
-            # 404 = user not found by msisdn (meta attribute); 401 = user found but not verified — try oodi in payload.body
             if key != "msisdn" or not value:
                 raise
             if getattr(e, "status_code", None) not in (404, 401):
                 raise
-            config = _get_config()
-            if not config:
-                print(f"[oodi_login] no config, re-raising")
+            if not _get_config():
                 raise
-            shortname = await _resolve_shortname_by_oodi_in_body(str(value).strip(), config, by_shortname=False)
-            print(f"[oodi_login] oodi-in-body lookup for msisdn={value!r} -> shortname={shortname!r}")
+            shortname = await _resolve_shortname_by_oodi_in_body(str(value).strip(), by_shortname=False)
             if shortname:
                 return shortname
             raise
@@ -217,10 +191,9 @@ def _apply_patches() -> None:
 
     async def _send_otp_wrapper(msisdn: str, language: str):
         result = await _original_send_otp(msisdn, language)
-        config = _get_config()
-        if not config:
+        if not _get_config():
             return result
-        shortname = await _resolve_shortname_by_oodi_in_body(msisdn.strip(), config, by_shortname=False)
+        shortname = await _resolve_shortname_by_oodi_in_body(msisdn.strip(), by_shortname=False)
         if shortname:
             try:
                 code = await db.get_otp(f"users:otp:otps/{msisdn}")
