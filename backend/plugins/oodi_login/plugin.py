@@ -1,8 +1,10 @@
 """
-Oodi login plugin: for login with "msisdn" in the body, first checks if that value exists
-in any user's payload.body; if yes, rewrites the request to use that user's shortname so
-login proceeds. If not found in payload body, the regular login flow runs (msisdn as usual).
-Uses ASGI middleware to rewrite the request body when a user is found by payload body.
+Oodi login plugin: when login has identifier (msisdn or shortname) + (otp or password),
+first try to resolve/match using oodi number in user payload.body. If found, use that flow;
+otherwise fall back to original flow.
+- Password + msisdn (oodi): rewrite to shortname + password.
+- OTP + msisdn (oodi): pass through (get_shortname_from_identifier resolves via payload body; OTP key = msisdn).
+- OTP + shortname: pass through; send_otp is patched to store OTP under shortname when msisdn is oodi.
 """
 import json
 from pathlib import Path
@@ -25,7 +27,6 @@ def _get_config() -> dict | None:
 
 
 def _msisdn_from_body(body: dict) -> str | None:
-    """Get msisdn from request body (top-level only; field name stays msisdn)."""
     if not body or not isinstance(body, dict):
         return None
     msisdn = body.get("msisdn")
@@ -34,23 +35,42 @@ def _msisdn_from_body(body: dict) -> str | None:
     return None
 
 
-async def _resolve_shortname_by_payload_body_msisdn(msisdn_value: str, config: dict) -> str | None:
+def _shortname_from_body(body: dict) -> str | None:
+    if not body or not isinstance(body, dict):
+        return None
+    s = body.get("shortname")
+    if s is not None and s != "":
+        return str(s).strip() or None
+    return None
+
+
+async def _resolve_shortname_by_oodi_in_body(identifier_value: str, config: dict, by_shortname: bool = False) -> str | None:
     """
-    Find a user whose payload.body contains this msisdn value (e.g. payload.body.msisdn).
-    Uses db.query with search on payload.body.<payload_field>; if no result, returns None
-    so the regular login flow runs. Does not use get_user_by_criteria(msisdn) (user attribute).
+    Find a user by oodi number in payload.body.
+    If by_shortname=True, identifier_value is a shortname: load user and check payload.body has oodi_number/msisdn (we just return that shortname if we can load user and config says we care).
+    If by_shortname=False, identifier_value is msisdn: search users where payload.body.oodi_number (or msisdn) = value.
     """
     from data_adapters.adapter import data_adapter as db
     from utils.settings import settings
     import models.api as api
+    import models.core as core
 
-    # payload_field = (config or {}).get("payload_body_msisdn_field") or "msisdn"
-    # query_user = (config or {}).get("query_user")
+    payload_field = (config or {}).get("payload_body_msisdn_field") or "oodi_number"
+    query_user = (config or {}).get("query_user") or "dmart"
+
+    if by_shortname:
+        user = await db.load_or_none(settings.management_space, "/users", identifier_value, core.User)
+        if not user:
+            return None
+        payload_body = getattr(getattr(user, "payload", None), "body", None)
+        if isinstance(payload_body, dict) and (payload_body.get(payload_field) or payload_body.get("msisdn")):
+            return identifier_value
+        return None
 
     try:
-        # Search users by payload.body.<payload_field> = msisdn_value (not user's msisdn column)
-        search_value = msisdn_value.replace("\\", "\\\\").replace('"', '\\"')
-        search = f'@payload.body.oodi_number:{search_value}'
+        search_value = identifier_value.replace("\\", "\\\\").replace('"', '\\"')
+        # Resolve by payload.body.oodi_number (not user's msisdn meta attribute — that's get_user_by_criteria)
+        search = f'@payload.body.{payload_field}:{search_value}'
         query = api.Query(
             type=api.QueryType.search,
             space_name=settings.management_space,
@@ -60,19 +80,29 @@ async def _resolve_shortname_by_payload_body_msisdn(msisdn_value: str, config: d
             offset=0,
             retrieve_json_payload=False,
         )
-        total, records = await db.query(query, "dmart")
-        print(f"this is the records: {records}")
-        if total and records and len(records) > 0:
-            shortname = records[0].shortname
-            print(f"this is the shortname: {shortname}")
-            return shortname
+        print(f"[oodi_login] resolve by payload.body: search={search!r} query_user={query_user!r}")
+        total, records = await db.query(query, query_user)
+        print(f"[oodi_login] query result: total={total} records={len(records) if records else 0} first_shortname={records[0].shortname if records else None!r}")
+        if total and records:
+            return records[0].shortname
+        # Fallback: try payload.body.msisdn (still body, not meta msisdn)
+        if payload_field != "msisdn":
+            search2 = f'@payload.body.msisdn:{search_value}'
+            query.search = search2
+            print(f"[oodi_login] fallback search payload.body.msisdn: {search2!r}")
+            total, records = await db.query(query, query_user)
+            print(f"[oodi_login] fallback result: total={total} first_shortname={records[0].shortname if records else None!r}")
+            if total and records:
+                return records[0].shortname
+        print(f"[oodi_login] no user found for identifier_value={identifier_value!r} (payload.body lookup)")
         return None
-    except Exception:
+    except Exception as exc:
+        print(f"[oodi_login] _resolve_shortname_by_oodi_in_body error: {exc!r}")
         return None
 
 
 class _OodiLoginMiddleware:
-    """ASGI middleware: for POST /user/login with msisdn, rewrite to shortname when that msisdn exists in a user's payload.body."""
+    """For POST /user/login: if identifier (msisdn or shortname) + (otp or password), try oodi-in-body first; else original flow."""
 
     def __init__(self, app):
         self.app = app
@@ -93,7 +123,6 @@ class _OodiLoginMiddleware:
             await self.app(scope, receive, send)
             return
 
-        # Consume body (only once)
         body_chunks = []
         while True:
             message = await receive()
@@ -110,16 +139,34 @@ class _OodiLoginMiddleware:
             await self.app(scope, _receive, send)
             return
 
-        # Field name stays "msisdn"; first check if it exists in any user's payload body
+        has_otp = data.get("otp") is not None and data.get("otp") != ""
+        has_password = data.get("password") is not None and data.get("password") != ""
+        if not (has_otp or has_password):
+            # No otp/password: pass through unchanged
+            async def _receive():
+                return {"type": "http.request", "body": body_bytes, "more_body": False}
+            await self.app(scope, _receive, send)
+            return
+
         msisdn_value = _msisdn_from_body(data)
+        shortname_value = _shortname_from_body(data)
+        print(f"[oodi_login] login body: msisdn={msisdn_value!r} shortname={shortname_value!r} has_otp={has_otp} has_password={has_password}")
+
+        # Try oodi-in-body: identifier is msisdn or shortname (payload.body.oodi_number / msisdn, not meta msisdn)
+        shortname = None
         if msisdn_value is not None:
-            shortname = await _resolve_shortname_by_payload_body_msisdn(msisdn_value, config)
-            if shortname:
-                # Rewrite body so login receives only shortname (one identifier; remove msisdn to avoid "Too many input")
-                data = dict(data)
-                data.pop("msisdn", None)
-                data["shortname"] = shortname
-                body_bytes = json.dumps(data).encode("utf-8")
+            shortname = await _resolve_shortname_by_oodi_in_body(msisdn_value, config, by_shortname=False)
+            print(f"[oodi_login] middleware: msisdn={msisdn_value!r} -> shortname={shortname!r}")
+        elif shortname_value is not None:
+            shortname = await _resolve_shortname_by_oodi_in_body(shortname_value, config, by_shortname=True)
+            print(f"[oodi_login] middleware: shortname={shortname_value!r} (by_shortname) -> shortname={shortname!r}")
+
+        if shortname and msisdn_value is not None and not has_otp:
+            # Password login with msisdn (oodi): rewrite to shortname so only one identifier
+            data = dict(data)
+            data.pop("msisdn", None)
+            data["shortname"] = shortname
+            body_bytes = json.dumps(data).encode("utf-8")
 
         async def _receive():
             return {"type": "http.request", "body": body_bytes, "more_body": False}
@@ -128,17 +175,74 @@ class _OodiLoginMiddleware:
 
 
 def _apply_patches() -> None:
+    from api.user import service as user_service
+    from api.user import router as user_router
+    from data_adapters.adapter import data_adapter as db
+    import models.api as api
+
+    _original_get_shortname = user_service.get_shortname_from_identifier
+
+    async def _get_shortname_wrapper(*args, **kwargs):
+        key = kwargs.get("key", args[0] if args else None)
+        value = kwargs.get("value", args[1] if len(args) > 1 else None)
+        print(f"[oodi_login] get_shortname_from_identifier called: key={key!r} value={value!r}")
+        try:
+            out = await _original_get_shortname(*args, **kwargs)
+            print(f"[oodi_login] get_shortname_from_identifier original returned: {out!r}")
+            return out
+        except api.Exception as e:
+            print(f"[oodi_login] get_shortname_from_identifier original raised: status_code={getattr(e, 'status_code', None)} error.code={getattr(getattr(e, 'error', None), 'code', None)}")
+            # 404 = user not found by msisdn (meta attribute); 401 = user found but not verified — try oodi in payload.body
+            if key != "msisdn" or not value:
+                raise
+            if getattr(e, "status_code", None) not in (404, 401):
+                raise
+            config = _get_config()
+            if not config:
+                print(f"[oodi_login] no config, re-raising")
+                raise
+            shortname = await _resolve_shortname_by_oodi_in_body(str(value).strip(), config, by_shortname=False)
+            print(f"[oodi_login] oodi-in-body lookup for msisdn={value!r} -> shortname={shortname!r}")
+            if shortname:
+                return shortname
+            raise
+
+    user_service.get_shortname_from_identifier = _get_shortname_wrapper
+    # Router imports get_shortname_from_identifier at load time — patch its reference too (like send_otp in OTP plugin)
+    user_router.get_shortname_from_identifier = _get_shortname_wrapper
+
+    # When OTP is requested for an msisdn that is an oodi number (in payload body), also store OTP under shortname
+    # so that login with shortname + otp finds the OTP.
+    _original_send_otp = user_service.send_otp
+
+    async def _send_otp_wrapper(msisdn: str, language: str):
+        result = await _original_send_otp(msisdn, language)
+        config = _get_config()
+        if not config:
+            return result
+        shortname = await _resolve_shortname_by_oodi_in_body(msisdn.strip(), config, by_shortname=False)
+        if shortname:
+            try:
+                code = await db.get_otp(f"users:otp:otps/{msisdn}")
+                if code:
+                    await db.save_otp(f"users:otp:otps/{shortname}", code)
+            except Exception:
+                pass
+        return result
+
+    user_service.send_otp = _send_otp_wrapper
+
     app = globals().get("app")
     if app is None:
         return
     app.add_middleware(_OodiLoginMiddleware)
-    print("hey i ran --------------------------")
 
 
 class Plugin(PluginBase):
-    """Hook plugin: on load, adds middleware so msisdn in body can resolve via user payload.body first."""
+    """Hook plugin: login by msisdn or shortname + otp/password uses oodi number in payload.body first, else original flow."""
 
     async def hook(self, data: Event) -> None:
         pass
+
 
 _apply_patches()
