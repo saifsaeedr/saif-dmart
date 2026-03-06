@@ -1,0 +1,14 @@
+{
+  "shortname": "seller_onboarding",
+  "is_active": true,
+  "filters": {
+    "subpaths": ["__ALL__"],
+    "resource_types": ["user"],
+    "schema_shortnames": ["__ALL__"],
+    "actions": ["create"]
+  },
+  "type": "hook",
+  "ordinal": 2,
+  "listen_time": "after",
+  "concurrent": false
+}

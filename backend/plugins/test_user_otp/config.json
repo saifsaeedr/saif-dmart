@@ -1,0 +1,14 @@
+{
+  "shortname": "test_user_otp",
+  "is_active": true,
+  "filters": {
+    "subpaths": ["__ALL__"],
+    "resource_types": ["__ALL__"],
+    "schema_shortnames": ["__ALL__"],
+    "actions": []
+  },
+  "type": "hook",
+  "listen_time": "after",
+  "msisdns": ["9647801111111"],
+  "fixed_otp": "111111"
+}

@@ -1,0 +1,13 @@
+{
+  "shortname": "email_order_update",
+  "is_active": true,
+  "filters": {
+    "subpaths": ["__ALL__"],
+    "resource_types": ["ticket"],
+    "schema_shortnames": ["__ALL__"],
+    "actions": ["progress_ticket"]
+  },
+  "type": "hook",
+  "ordinal": 10,
+  "listen_time": "after"
+}
